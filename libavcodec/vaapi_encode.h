@@ -220,6 +220,13 @@ typedef struct VAAPIEncodeContext {
     VAEncMiscParameterBufferQualityLevel quality_params;
 #endif
 
+    // AVCodecContext bitrate settings that the rate control parameters
+    // above were last derived from.  Used to detect changes to them while
+    // encoding, which are then applied without starting a new sequence.
+    int64_t         rc_cfg_bit_rate;
+    int64_t         rc_cfg_max_rate;
+    int64_t         rc_cfg_buffer_size;
+
     // Per-sequence parameter structure (VAEncSequenceParameterBuffer*).
     void           *codec_sequence_params;
 

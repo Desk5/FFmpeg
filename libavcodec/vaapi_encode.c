@@ -265,6 +265,10 @@ static int vaapi_encode_make_tile_slice(AVCodecContext *avctx,
     return 0;
 }
 
+static int vaapi_encode_update_rate_control(AVCodecContext *avctx,
+                                            VAAPIEncodePicture *pic,
+                                            int is_idr);
+
 static int vaapi_encode_issue(AVCodecContext *avctx,
                               FFHWBaseEncodePicture *base_pic)
 {
@@ -336,6 +340,11 @@ static int vaapi_encode_issue(AVCodecContext *avctx,
     }
 
     pic->nb_param_buffers = 0;
+
+    err = vaapi_encode_update_rate_control(avctx, pic,
+                                           base_pic->type == FF_HW_PICTURE_TYPE_IDR);
+    if (err < 0)
+        goto fail;
 
     if (base_pic->type == FF_HW_PICTURE_TYPE_IDR && ctx->codec->init_sequence_params) {
         err = vaapi_encode_make_param_buffer(avctx, pic,
@@ -1154,6 +1163,205 @@ static const VAAPIEncodeRCMode vaapi_encode_rc_modes[] = {
 #endif
 };
 
+// Derive the bitrate-dependent rate control parameters for the given mode
+// from the current AVCodecContext settings.
+static int vaapi_encode_compute_bitrate_params(AVCodecContext *avctx,
+                                               const VAAPIEncodeRCMode *rc_mode,
+                                               int64_t *rc_bits_per_second,
+                                               int     *rc_target_percentage,
+                                               int     *rc_window_size,
+                                               int64_t *hrd_buffer_size,
+                                               int64_t *hrd_initial_buffer_fullness)
+{
+    if (rc_mode->bitrate) {
+        if (avctx->bit_rate <= 0) {
+            av_log(avctx, AV_LOG_ERROR, "Bitrate must be set for %s "
+                   "RC mode.\n", rc_mode->name);
+            return AVERROR(EINVAL);
+        }
+
+        if (rc_mode->mode == RC_MODE_AVBR) {
+            // For maximum confusion AVBR is hacked into the existing API
+            // by overloading some of the fields with completely different
+            // meanings.
+
+            // Target percentage does not apply in AVBR mode.
+            *rc_bits_per_second = avctx->bit_rate;
+
+            // Accuracy tolerance range for meeting the specified target
+            // bitrate.  It's very unclear how this is actually intended
+            // to work - since we do want to get the specified bitrate,
+            // set the accuracy to 100% for now.
+            *rc_target_percentage = 100;
+
+            // Convergence period in frames.  The GOP size reflects the
+            // user's intended block size for cutting, so reusing that
+            // as the convergence period seems a reasonable default.
+            *rc_window_size = avctx->gop_size > 0 ? avctx->gop_size : 60;
+
+        } else if (rc_mode->maxrate) {
+            if (avctx->rc_max_rate > 0) {
+                if (avctx->rc_max_rate < avctx->bit_rate) {
+                    av_log(avctx, AV_LOG_ERROR, "Invalid bitrate settings: "
+                           "bitrate (%"PRId64") must not be greater than "
+                           "maxrate (%"PRId64").\n", avctx->bit_rate,
+                           avctx->rc_max_rate);
+                    return AVERROR(EINVAL);
+                }
+                *rc_bits_per_second   = avctx->rc_max_rate;
+                *rc_target_percentage = (avctx->bit_rate * 100) /
+                                        avctx->rc_max_rate;
+            } else {
+                // We only have a target bitrate, but this mode requires
+                // that a maximum rate be supplied as well.  Since the
+                // user does not want this to be a constraint, arbitrarily
+                // pick a maximum rate of double the target rate.
+                *rc_bits_per_second   = 2 * avctx->bit_rate;
+                *rc_target_percentage = 50;
+            }
+        } else {
+            if (avctx->rc_max_rate > avctx->bit_rate) {
+                av_log(avctx, AV_LOG_WARNING, "Max bitrate is ignored "
+                       "in %s RC mode.\n", rc_mode->name);
+            }
+            *rc_bits_per_second   = avctx->bit_rate;
+            *rc_target_percentage = 100;
+        }
+    } else {
+        *rc_bits_per_second   = 0;
+        *rc_target_percentage = 100;
+    }
+
+    if (rc_mode->hrd) {
+        if (avctx->rc_buffer_size)
+            *hrd_buffer_size = avctx->rc_buffer_size;
+        else if (avctx->rc_max_rate > 0)
+            *hrd_buffer_size = avctx->rc_max_rate;
+        else
+            *hrd_buffer_size = avctx->bit_rate;
+        if (avctx->rc_initial_buffer_occupancy) {
+            if (avctx->rc_initial_buffer_occupancy > *hrd_buffer_size) {
+                av_log(avctx, AV_LOG_ERROR, "Invalid RC buffer settings: "
+                       "must have initial buffer size (%d) <= "
+                       "buffer size (%"PRId64").\n",
+                       avctx->rc_initial_buffer_occupancy, *hrd_buffer_size);
+                return AVERROR(EINVAL);
+            }
+            *hrd_initial_buffer_fullness = avctx->rc_initial_buffer_occupancy;
+        } else {
+            *hrd_initial_buffer_fullness = *hrd_buffer_size * 3 / 4;
+        }
+
+        *rc_window_size = (*hrd_buffer_size * 1000) / *rc_bits_per_second;
+    } else {
+        if (avctx->rc_buffer_size || avctx->rc_initial_buffer_occupancy) {
+            av_log(avctx, AV_LOG_WARNING, "Buffering settings are ignored "
+                   "in %s RC mode.\n", rc_mode->name);
+        }
+
+        *hrd_buffer_size             = 0;
+        *hrd_initial_buffer_fullness = 0;
+
+        if (rc_mode->mode != RC_MODE_AVBR) {
+            // Already set (with completely different meaning) for AVBR.
+            *rc_window_size = 1000;
+        }
+    }
+
+    if (*rc_bits_per_second          > UINT32_MAX ||
+        *hrd_buffer_size             > UINT32_MAX ||
+        *hrd_initial_buffer_fullness > UINT32_MAX) {
+        av_log(avctx, AV_LOG_ERROR, "RC parameters of 2^32 or "
+               "greater are not supported by VAAPI.\n");
+        return AVERROR(EINVAL);
+    }
+
+    return 0;
+}
+
+// Apply changes to the bitrate settings (bit_rate, rc_max_rate,
+// rc_buffer_size) made by the user while encoding.  The new rate control
+// parameters are attached to the given picture with a BRC reset, so the
+// change takes effect without starting a new sequence.
+static int vaapi_encode_update_rate_control(AVCodecContext *avctx,
+                                            VAAPIEncodePicture *pic,
+                                            int is_idr)
+{
+    VAAPIEncodeContext *ctx = avctx->priv_data;
+    VAEncMiscParameterRateControl rc_params;
+    int64_t rc_bits_per_second, hrd_buffer_size, hrd_initial_buffer_fullness;
+    int rc_target_percentage, rc_window_size;
+    int err;
+
+    if (!ctx->rc_mode->bitrate)
+        return 0;
+
+    if (avctx->bit_rate       == ctx->rc_cfg_bit_rate &&
+        avctx->rc_max_rate    == ctx->rc_cfg_max_rate &&
+        avctx->rc_buffer_size == ctx->rc_cfg_buffer_size)
+        return 0;
+
+    // Record the settings even if they turn out to be invalid, so they are
+    // not re-validated (and warned about) on every picture.
+    ctx->rc_cfg_bit_rate    = avctx->bit_rate;
+    ctx->rc_cfg_max_rate    = avctx->rc_max_rate;
+    ctx->rc_cfg_buffer_size = avctx->rc_buffer_size;
+
+    err = vaapi_encode_compute_bitrate_params(avctx, ctx->rc_mode,
+                                              &rc_bits_per_second,
+                                              &rc_target_percentage,
+                                              &rc_window_size,
+                                              &hrd_buffer_size,
+                                              &hrd_initial_buffer_fullness);
+    if (err < 0) {
+        av_log(avctx, AV_LOG_WARNING, "Ignoring invalid bitrate change.\n");
+        return 0;
+    }
+
+    av_log(avctx, AV_LOG_VERBOSE, "RC target changed: %d%% of "
+           "%"PRId64" bps over %d ms.\n", rc_target_percentage,
+           rc_bits_per_second, rc_window_size);
+
+    // The global parameters point at these, so later IDR pictures pick up
+    // the new values too.  The sequence parameters keep the original
+    // bitrate - drivers take the rate control misc parameters, which follow
+    // them, as authoritative.
+    ctx->va_bit_rate                 = rc_bits_per_second;
+    ctx->rc_params.bits_per_second   = rc_bits_per_second;
+    ctx->rc_params.target_percentage = rc_target_percentage;
+    ctx->rc_params.window_size       = rc_window_size;
+    if (ctx->rc_mode->hrd) {
+        ctx->hrd_params.buffer_size             = hrd_buffer_size;
+        ctx->hrd_params.initial_buffer_fullness = hrd_initial_buffer_fullness;
+    }
+
+    if (is_idr) {
+        // Already covered by the global parameters.
+        return 0;
+    }
+
+    rc_params = ctx->rc_params;
+#if VA_CHECK_VERSION(0, 39, 2)
+    rc_params.rc_flags.bits.reset = 1;
+#endif
+    err = vaapi_encode_make_misc_param_buffer(avctx, pic,
+                                              VAEncMiscParameterTypeRateControl,
+                                              &rc_params, sizeof(rc_params));
+    if (err < 0)
+        return err;
+
+    if (ctx->rc_mode->hrd) {
+        err = vaapi_encode_make_misc_param_buffer(avctx, pic,
+                                                  VAEncMiscParameterTypeHRD,
+                                                  &ctx->hrd_params,
+                                                  sizeof(ctx->hrd_params));
+        if (err < 0)
+            return err;
+    }
+
+    return 0;
+}
+
 static av_cold int vaapi_encode_init_rate_control(AVCodecContext *avctx)
 {
     VAAPIEncodeContext *ctx = avctx->priv_data;
@@ -1168,6 +1376,7 @@ static av_cold int vaapi_encode_init_rate_control(AVCodecContext *avctx)
     int fr_num, fr_den;
     VAConfigAttrib rc_attr = { VAConfigAttribRateControl };
     VAStatus vas;
+    int err;
     char supported_rc_modes_string[64];
 
     vas = vaGetConfigAttributes(ctx->hwctx->display,
@@ -1290,64 +1499,14 @@ static av_cold int vaapi_encode_init_rate_control(AVCodecContext *avctx)
     return AVERROR(EINVAL);
 
 rc_mode_found:
-    if (rc_mode->bitrate) {
-        if (avctx->bit_rate <= 0) {
-            av_log(avctx, AV_LOG_ERROR, "Bitrate must be set for %s "
-                   "RC mode.\n", rc_mode->name);
-            return AVERROR(EINVAL);
-        }
-
-        if (rc_mode->mode == RC_MODE_AVBR) {
-            // For maximum confusion AVBR is hacked into the existing API
-            // by overloading some of the fields with completely different
-            // meanings.
-
-            // Target percentage does not apply in AVBR mode.
-            rc_bits_per_second = avctx->bit_rate;
-
-            // Accuracy tolerance range for meeting the specified target
-            // bitrate.  It's very unclear how this is actually intended
-            // to work - since we do want to get the specified bitrate,
-            // set the accuracy to 100% for now.
-            rc_target_percentage = 100;
-
-            // Convergence period in frames.  The GOP size reflects the
-            // user's intended block size for cutting, so reusing that
-            // as the convergence period seems a reasonable default.
-            rc_window_size = avctx->gop_size > 0 ? avctx->gop_size : 60;
-
-        } else if (rc_mode->maxrate) {
-            if (avctx->rc_max_rate > 0) {
-                if (avctx->rc_max_rate < avctx->bit_rate) {
-                    av_log(avctx, AV_LOG_ERROR, "Invalid bitrate settings: "
-                           "bitrate (%"PRId64") must not be greater than "
-                           "maxrate (%"PRId64").\n", avctx->bit_rate,
-                           avctx->rc_max_rate);
-                    return AVERROR(EINVAL);
-                }
-                rc_bits_per_second   = avctx->rc_max_rate;
-                rc_target_percentage = (avctx->bit_rate * 100) /
-                                       avctx->rc_max_rate;
-            } else {
-                // We only have a target bitrate, but this mode requires
-                // that a maximum rate be supplied as well.  Since the
-                // user does not want this to be a constraint, arbitrarily
-                // pick a maximum rate of double the target rate.
-                rc_bits_per_second   = 2 * avctx->bit_rate;
-                rc_target_percentage = 50;
-            }
-        } else {
-            if (avctx->rc_max_rate > avctx->bit_rate) {
-                av_log(avctx, AV_LOG_WARNING, "Max bitrate is ignored "
-                       "in %s RC mode.\n", rc_mode->name);
-            }
-            rc_bits_per_second   = avctx->bit_rate;
-            rc_target_percentage = 100;
-        }
-    } else {
-        rc_bits_per_second   = 0;
-        rc_target_percentage = 100;
-    }
+    err = vaapi_encode_compute_bitrate_params(avctx, rc_mode,
+                                              &rc_bits_per_second,
+                                              &rc_target_percentage,
+                                              &rc_window_size,
+                                              &hrd_buffer_size,
+                                              &hrd_initial_buffer_fullness);
+    if (err < 0)
+        return err;
 
     if (rc_mode->quality) {
         if (ctx->explicit_qp) {
@@ -1366,54 +1525,14 @@ rc_mode_found:
         rc_quality = 0;
     }
 
-    if (rc_mode->hrd) {
-        if (avctx->rc_buffer_size)
-            hrd_buffer_size = avctx->rc_buffer_size;
-        else if (avctx->rc_max_rate > 0)
-            hrd_buffer_size = avctx->rc_max_rate;
-        else
-            hrd_buffer_size = avctx->bit_rate;
-        if (avctx->rc_initial_buffer_occupancy) {
-            if (avctx->rc_initial_buffer_occupancy > hrd_buffer_size) {
-                av_log(avctx, AV_LOG_ERROR, "Invalid RC buffer settings: "
-                       "must have initial buffer size (%d) <= "
-                       "buffer size (%"PRId64").\n",
-                       avctx->rc_initial_buffer_occupancy, hrd_buffer_size);
-                return AVERROR(EINVAL);
-            }
-            hrd_initial_buffer_fullness = avctx->rc_initial_buffer_occupancy;
-        } else {
-            hrd_initial_buffer_fullness = hrd_buffer_size * 3 / 4;
-        }
-
-        rc_window_size = (hrd_buffer_size * 1000) / rc_bits_per_second;
-    } else {
-        if (avctx->rc_buffer_size || avctx->rc_initial_buffer_occupancy) {
-            av_log(avctx, AV_LOG_WARNING, "Buffering settings are ignored "
-                   "in %s RC mode.\n", rc_mode->name);
-        }
-
-        hrd_buffer_size             = 0;
-        hrd_initial_buffer_fullness = 0;
-
-        if (rc_mode->mode != RC_MODE_AVBR) {
-            // Already set (with completely different meaning) for AVBR.
-            rc_window_size = 1000;
-        }
-    }
-
-    if (rc_bits_per_second          > UINT32_MAX ||
-        hrd_buffer_size             > UINT32_MAX ||
-        hrd_initial_buffer_fullness > UINT32_MAX) {
-        av_log(avctx, AV_LOG_ERROR, "RC parameters of 2^32 or "
-               "greater are not supported by VAAPI.\n");
-        return AVERROR(EINVAL);
-    }
-
     ctx->rc_mode     = rc_mode;
     ctx->rc_quality  = rc_quality;
     ctx->va_rc_mode  = rc_mode->va_mode;
     ctx->va_bit_rate = rc_bits_per_second;
+
+    ctx->rc_cfg_bit_rate    = avctx->bit_rate;
+    ctx->rc_cfg_max_rate    = avctx->rc_max_rate;
+    ctx->rc_cfg_buffer_size = avctx->rc_buffer_size;
 
     av_log(avctx, AV_LOG_VERBOSE, "RC mode: %s.\n", rc_mode->name);
 
